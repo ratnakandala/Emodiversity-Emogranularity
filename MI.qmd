@@ -1,0 +1,583 @@
+---
+title: "MI_May 2026"
+author: "Ratna"
+format: html
+editor: visual
+---
+
+```{r}
+library(mice) #for MI (creating the imputed datasets, method vector, prediction matrix, convergence plots)
+library(miceadds) #provides 2l.norm
+library(dplyr) #useful for data wrangling - mutate, select, filter, group_by
+library(tidyr) #for reshaping data into LONG format - complete() comes from here
+library(lme4) #to run the lmer regression models
+library(broom.mixed) #needed for pool() with lmer output
+library(ggplot2) #plots, visualizations
+library(datawizard) #for standardization
+library(effectsize)
+library(purrr) #for imap
+library(knitr)
+library(easystats)
+library(stringr)
+library(interactions)
+library(marginaleffects)
+library(jtools)
+```
+
+#Load the input file
+
+```{r}
+df <- read.csv("Input for MI.csv")
+```
+
+#Calculate (a)mean for the predictor variables and add these new columns to df
+
+```{r}
+
+df <-  df %>%
+        group_by(connectionId) %>%
+        mutate(
+        #Mean of posemo and negemo
+        posemo_mean = mean(posemo, na.rm = TRUE),
+        negemo_mean = mean(negemo, na.rm = TRUE),
+        
+        #mean of positive and negative diversity
+        posdiv_mean = mean(positive_diversity_Shannons_lem, na.rm = TRUE),
+        negdiv_mean = mean(negative_diversity_Shannons_lem, na.rm = TRUE),
+        
+        #mean of positive and negative granularity
+        posgran_mean = mean(positive_granularity_lemm, na.rm = TRUE),
+        neggran_mean = mean(negative_granularity_lemm, na.rm = TRUE),
+        
+        #mean of valence
+        valence_mean = mean(valence, na.rm = TRUE)
+        ) %>%
+        ungroup()
+```
+
+#Input for MI
+
+```{r}
+mice_input_df <- df %>%
+  filter(!is.na(connectionId)) %>%    # ← remove 4 NA rows
+  filter(!is.na(valence)) %>% #remove rows without valence
+  select(connectionId,
+         alias,
+         
+         #raw variables
+         valence,
+         posemo,
+         negemo,
+         positive_granularity_lemm,
+         negative_granularity_lemm,
+         positive_diversity_Shannons_lem,
+         negative_diversity_Shannons_lem,
+         
+         #person level means for predictors
+         valence_mean,
+         posemo_mean,
+         negemo_mean,
+         posgran_mean,
+         neggran_mean,
+         posdiv_mean,
+         negdiv_mean
+        ) %>%
+    mutate(
+          posemo_negemo = posemo * negemo,
+          posdiv_negdiv = positive_diversity_Shannons_lem * negative_diversity_Shannons_lem,
+          posgran_neggran =  positive_granularity_lemm * negative_granularity_lemm
+    )
+```
+
+```{r}
+#Create method vector
+meth <- rep("", ncol(mice_input_df)) #creates an empty vector of the same length as the number of columns in the dataset
+names(meth) <- colnames(mice_input_df) #assigns the column names of the dataset as the names of the meth vector
+#Predict positive and negative granularity values using 2l.norm (two-level heteroskedastic model)
+meth[c("positive_granularity_lemm", "negative_granularity_lemm")] <- "2l.norm" #for all the columns in the dataset, we will use the 2l.norm method for imputation
+
+#Passively impute all interaction terms with missing values
+#This is the only interaction whose components have missing values
+meth["posgran_neggran"] <- "~I(positive_granularity_lemm * negative_granularity_lemm)"
+
+#Set valence to "" so it is only used as predictor/filter, not imputed
+meth[c("valence")] <- ""  #already "" by default, but made explicit for clarity
+```
+
+```{r}
+#Create Prediction Matrix
+pred <- make.predictorMatrix(mice_input_df)
+
+#Set connectionId as cluster variable for multilevel imputation
+pred[, "connectionId"] <- -2 
+    #setting -2 in the predictor matrix identifies it as the cluster so it can calculate the "between-person" and "within-person" variance 
+
+#Don't predict granularity values from their interaction 
+# To prevent circular prediction : posgran_neggran is derived FROM these,
+# so it cannot be used to predict them
+pred["positive_granularity_lemm", "posgran_neggran"] <- 0
+pred["negative_granularity_lemm", "posgran_neggran"] <- 0
+
+#Don't predict gran terms as well as their interaction from "valence"
+pred["positive_granularity_lemm", "valence"] <- 0
+pred["negative_granularity_lemm", "valence"] <- 0
+pred["posgran_neggran", "valence"] <- 0
+
+#Don't predict granularity from itself
+pred["positive_granularity_lemm", c("positive_granularity_lemm", "negative_granularity_lemm")] <- 0
+pred["negative_granularity_lemm", c("positive_granularity_lemm", "negative_granularity_lemm")] <- 0
+
+#Don't predict the gran interaction variable from either of them
+pred["posgran_neggran", c("positive_granularity_lemm", "negative_granularity_lemm")] <- 0
+```
+
+```{r}
+#Create an empty post-processing matrix
+#Postprocessing ensures that the imputed granularity values stay within valid range
+post <- make.post(mice_input_df)
+```
+
+\`
+
+```{r}
+#Create m imputed datasets 
+imputed_data <- mice(mice_input_df,
+    m = 100, #meaning there will be m unique guesses/imputed datasets which need to               be pooled later to one value across all m using Rubin's rules
+    maxit = 50, #(with 50 iterations per dataset)
+    predictorMatrix = pred,
+    method = meth,
+    post = post,
+    printFlag = FALSE,
+    seed = 2023
+)
+```
+
+
+
+```{r}
+#Check for convergence
+plot(imputed_data)
+```
+
+
+#Calculate person mean centered values grouping by each m and connectionId
+```{r}
+#1) Create long format with pmc values
+long_pmc <- mice::complete(imputed_data, action = "long", include = TRUE) %>%
+                       group_by(.imp, connectionId)    %>% 
+                       mutate(
+                            # Recalculate person means POST imputation
+                            posgran_mean_updated = mean(positive_granularity_lemm, na.rm = TRUE),
+                            neggran_mean_updated = mean(negative_granularity_lemm, na.rm = TRUE),
+                         
+                         
+                            #PMC after MI
+                            #Person-mean-centered granularity 
+                            posgran_pmc = positive_granularity_lemm - posgran_mean_updated,
+                            neggran_pmc = negative_granularity_lemm - neggran_mean_updated,
+                            
+                            #Person-mean-centering for the predictor variable - diversity
+                            posdiv_pmc = positive_diversity_Shannons_lem - posdiv_mean,
+                            negdiv_pmc = negative_diversity_Shannons_lem - negdiv_mean,
+                            
+                            #Person-mean-centering for posemo, negemo
+                            posemo_pmc = posemo - posemo_mean,
+                            negemo_pmc = negemo - negemo_mean,
+                            
+                            #Interaction terms using PMC
+                            posemo_negemo_pmc = posemo_pmc * negemo_pmc,
+                            posdiv_negdiv_pmc = posdiv_pmc * negdiv_pmc,
+                            posgran_neggran_pmc =  posgran_pmc * neggran_pmc
+                       ) %>%
+                       ungroup()
+
+#2) Convert to mids
+imputed_data_pmc <- mice::as.mids(long_pmc)
+```
+
+
+#Replace the values with NaNs for texts with 0 words
+```{r}
+#Add original_row_id to df
+df <- df %>% dplyr::mutate(original_row_id = row_number())
+
+#Extract the imputed data in long format
+imputed_datasets <- mice::complete(imputed_data_pmc, action = "long", include = TRUE) %>%
+    dplyr::left_join(
+    df %>%
+      dplyr::mutate(.id = row_number()) %>%
+      dplyr::select(.id,
+                    positive_all_words_count_lemm,
+                    negative_all_words_count_lemm),
+    by = ".id"
+  ) %>%
+  dplyr::mutate(
+    posgran_pmc = dplyr::if_else(
+      positive_all_words_count_lemm == 0, NA_real_, posgran_pmc),
+    neggran_pmc = dplyr::if_else(
+      negative_all_words_count_lemm == 0, NA_real_, neggran_pmc)
+  ) %>%
+  dplyr::select(-positive_all_words_count_lemm,   # ← drop after use
+                -negative_all_words_count_lemm)    # ← no longer needed
+
+#Convert back to mids
+imputed_data_clean <- mice::as.mids(imputed_datasets)
+```
+
+
+##Standardizing the filtered imputed data
+```{r}
+# Step 1: Extract long format
+long_data <- mice::complete(imputed_data_clean, action = "long", include = TRUE)
+
+# Step 2: Standardize within each .imp separately
+long_data_std <- long_data %>%
+  group_by(.imp) %>%
+  group_modify(~ datawizard::standardize(.x, select = c("posgran_pmc", 
+                                                         "neggran_pmc",
+                                                         "posemo_pmc", 
+                                                         "negemo_pmc",
+                                                         "posdiv_pmc", 
+                                                         "negdiv_pmc"))) %>%
+  ungroup()
+
+# Step 3: Convert back to mids
+imputed_data_std <- mice::as.mids(long_data_std)
+```
+
+
+#Null Model
+```{r}
+#Fit Null model
+nulmodel <- with(imputed_data_std, lme4::lmer(valence ~ 1 + (1|connectionId)))
+
+#Extract ICC from each imputed model and average
+iccs <- sapply(nulmodel$analyses, function(m) {
+ performance::icc(m)$ICC_adjusted
+})
+
+mean(iccs) #pooled ICC
+sd(iccs) #Variability across imputations
+```
+
+
+#(CONTROLLING FOR AFFECTIVE TONE)
+```{r}
+#Fit the model - Text Level
+mlm_v_s3 <- with(imputed_data_std, lme4::lmer(valence ~ posgran_pmc + #Individual Variables
+                                                        neggran_pmc +
+                                                        posemo_pmc + 
+                                                        negemo_pmc +
+                                                        posdiv_pmc +
+                                                        negdiv_pmc +
+                                                       
+                                                        #Interaction Terms (Calculated post MI)
+                                                        posemo_pmc * negemo_pmc +
+                                                        posdiv_pmc * negdiv_pmc +
+                                                        posgran_pmc * neggran_pmc +
+                                              
+                                                        #Random effect (texts nested within person)
+                                                        + (1 | connectionId)))
+
+
+#Pool them
+s3_pool <- mice::pool(mlm_v_s3)
+
+#View the final results with confidence intervals
+s3_pool_results <- summary(s3_pool, conf.int = TRUE)
+s3_pool_results
+```
+
+
+
+#MODEL(NOT CONTROLLING FOR AFFECTIVE TONE)
+```{r}
+main_1 <- with(imputed_data_std, lme4::lmer(valence ~
+                                            
+                                            #Main effects of interest
+                                            posgran_pmc +
+                                            neggran_pmc +
+                                            posdiv_pmc +
+                                            negdiv_pmc +
+                                              
+                                            #Interactions of interest
+                                            posgran_pmc * neggran_pmc +
+                                            posdiv_pmc * negdiv_pmc +
+                                              
+                                            #Random effect
+                                            (1 | connectionId)))
+
+main_1_pool <- mice::pool(main_1)
+main_1_pool_results <- summary(main_1_pool, conf.int = TRUE)
+main_1_pool_results
+```
+
+
+#Beta and p values for all interactions WITHOUT and WITH AFFECTIVE TONE
+```{r}
+# WITHOUT Affective Tone - interactions only
+print("WITHOUT Affective Tone - Interactions:")
+main_1_pool_results[main_1_pool_results$term %in% 
+                    c("posgran_pmc:neggran_pmc", "posdiv_pmc:negdiv_pmc"),
+                    c("term", "estimate", "p.value")]
+
+
+# WITH Affective Tone - interactions only
+print("WITH Affective Tone - Interactions:")
+s3_pool_results[s3_pool_results$term %in% 
+                c("posgran_pmc:neggran_pmc", "posdiv_pmc:negdiv_pmc"),
+                c("term", "estimate", "p.value")]
+```
+
+
+#plot
+```{r}
+nature_theme <- theme_classic() +
+  theme(
+    text = element_text(family = "serif"),
+    axis.title = element_text(size = 12, family = "serif"),
+    axis.text = element_text(size = 11, color = "black", family = "serif"),
+    legend.title = element_text(size = 11, face = "bold", family = "serif"),
+    legend.text = element_text(size = 10, family = "serif"),
+    plot.title = element_text(size = 13, hjust = 0.5, family = "serif"),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "grey40"),
+    plot.caption = element_text(size = 10, color = "grey50", hjust = 0),
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.4),
+    axis.ticks = element_line(color = "black", linewidth = 0.4),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12, face = "plain"),   
+    legend.key.width = unit(1.8, "cm")                     
+  )
+
+# Interaction plot
+interact_plot(
+  model_list_main_no_affective[[1]],
+  pred = posdiv_pmc,
+  modx = negdiv_pmc,
+  interval = TRUE,
+  int.width = 0.95,
+  colors = c("#2166AC", "#4DAC26", "#D6604D"),
+  x.label = "Positive diversity (person-mean-centered)",
+  y.label = "Momentary Valence",
+  legend.main = "Negative diversity",
+  modx.labels = c("-1 SD (b = 2.09)",
+                  "Mean (b = 2.59)",
+                  "+1 SD (b = 3.08)"),
+  plot.points = FALSE,
+  vary.lty = FALSE, #Forces all lines to be solid
+  pred.values = seq(-3, 3, by =0.1), #uniform x axis spacing
+  pred.point.size = 0,
+  robust = FALSE
+) +
+  nature_theme +
+  labs(
+    title = "Positive × Negative diversity Interaction"
+  ) +
+  annotate("text", x = Inf, y = Inf,
+           label = "β = 0.47, p < .001",
+           hjust = 1.1, vjust = 1.8,
+           size = 4, fontface = "italic",
+           color = "grey30") +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "grey50", linewidth = 0.4) +
+  guides(color = guide_legend(
+    override.aes = list(linewidth = 1.2),
+    keywidth = unit(1.5, "cm")
+  ),
+  linetype = "none" 
+  )
+
+ggsave("emodiversity_interaction.png",
+       width = 6.5, height = 4.0, dpi = 300, bg = "white")
+
+```
+
+
+#PERSON LEVEL RESULTS
+```{r}
+#Load External Files - diversity and WhoQOL and Join
+#This file contains combined person level posemo, negemo, diversity, MH scores
+d_person_diversity <- read.csv("Person level diversity.csv", fileEncoding='UTF-8-BOM', sep = ';') %>%
+  select(alias, posemo_person_avg, negemo_person_avg, positive_diversity_lem, negative_diversity_lem, Mental_mean)
+
+print(names(d_person_diversity))
+```
+
+
+```{r}
+# Clean alias function
+clean_alias <- function(x) {
+  x %>%
+    str_to_lower() %>%
+    str_replace_all("[^a-z0-9]", "")
+}
+
+# Step 2: Join using cleaned alias
+person_level_list <- lapply(person_level_list, function(df) {
+    df %>%
+      mutate(alias_clean = clean_alias(alias)) %>%
+      left_join(
+        d_person_diversity %>% 
+          mutate(alias_clean = clean_alias(alias)) %>%
+          select(-alias),  # drop original alias from d_person_diversity
+        by = "alias_clean"
+      ) %>%
+      select(-alias_clean)  # drop temp key after joining
+  })
+```
+
+
+```{r}
+# Step 3: # Convert list of 20 person-level datasets back to mids object
+person_mids <- bind_rows(
+  # Add the original data as .imp = 0 (required by as.mids)
+  person_level_list[[1]] %>% mutate(.imp = 0, .id = row_number()),
+  # Add all 20 imputed datasets with their index
+  lapply(seq_along(person_level_list), function(i) {
+    person_level_list[[i]] %>% mutate(.imp = i, .id = row_number())
+  }) %>% bind_rows()
+) %>%
+as.mids()
+```
+
+
+```{r}
+# Step 4: Standardize within each .imp at person level
+person_long <- mice::complete(person_mids, action = "long", include = TRUE)
+
+person_long_std <- person_long %>%
+  group_by(.imp) %>%
+  group_modify(~ datawizard::standardize(.x, select = c(
+                                                "posemo_person_avg",
+                                                "negemo_person_avg",
+                                                "positive_diversity_lem",
+                                                "negative_diversity_lem",
+                                                "posgran_person_avg_lemm",
+                                                "neggran_person_avg_lemm",
+                                                "Mental_mean"))) %>%
+  ungroup()
+
+# Step 5: Convert back to mids
+person_mids_std <- mice::as.mids(person_long_std)
+```
+
+
+#Mental Well Being - Pooling Results
+#Person level - With Affective Tone
+```{r}
+mr_wb_s3 <- with(person_mids_std, lm(Mental_mean ~ posemo_person_avg * negemo_person_avg +
+                             positive_diversity_lem * negative_diversity_lem+
+                             posgran_person_avg_lemm * neggran_person_avg_lemm))
+
+s3_person_pool <- mice::pool(mr_wb_s3)
+s3_person_results <- summary(s3_person_pool, conf.int = TRUE)
+s3_person_results
+```
+
+
+#person level - Without Affective Tone
+```{r}
+mr_wb_s4 <- with(person_mids_std, lm(Mental_mean ~ positive_diversity_lem * negative_diversity_lem +
+                                                   posgran_person_avg_lemm * neggran_person_avg_lemm))
+
+s4_person_pool <- mice::pool(mr_wb_s4)
+s4_person_results <- summary(s4_person_pool, conf.int = TRUE)
+s4_person_results
+```
+
+
+
+```{r}
+# Build model list for person-level visualization
+model_list_person <- map(
+  seq_len(person_mids_std$m),
+  \(i) {
+    dat_i <- mice::complete(person_mids_std, action = i)
+    lm(Mental_mean ~ positive_diversity_lem * negative_diversity_lem +
+                     posgran_person_avg_lemm * neggran_person_avg_lemm,
+       data = dat_i)
+  }
+)
+
+# Marginal effect of positive granularity
+model_list_person |>
+  map(\(x) estimate_relation(x, by = "posgran_person_avg_lemm")) |>
+  pool_predictions() |>
+  plot(show_data = TRUE) +
+  labs(title = "Positive Granularity and Mental Wellbeing",
+       x = "Positive Granularity (person avg)",
+       y = "Mental Wellbeing")
+
+# Marginal effect of negative granularity
+model_list_person |>
+  map(\(x) estimate_relation(x, by = "neggran_person_avg_lemm")) |>
+  pool_predictions() |>
+  plot(show_data = TRUE) +
+  labs(title = "Negative Granularity and Mental Wellbeing",
+       x = "Negative Granularity (person avg)",
+       y = "Mental Wellbeing")
+```
+
+
+```{r}
+dat_viz <- mice::complete(person_mids_std, action = 1)
+
+model_viz_person <- lm(Mental_mean ~ positive_diversity_lem * negative_diversity_lem +
+                                     posgran_person_avg_lemm * neggran_person_avg_lemm,
+                       data = dat_viz)
+
+# Positive granularity
+p1 <- effect_plot(model_viz_person,
+                  pred = posgran_person_avg_lemm,
+                  interval = TRUE,
+                  partial.residuals = TRUE,
+                  x.label = "Positive Granularity (person avg)",
+                  y.label = "Mental Wellbeing",
+                  colors = "royalblue1",
+                  line.colors = "black",
+                  point.size = 1.5,
+                  point.alpha = 0.3,
+                  jitter = 0.01)
+p1 + theme(axis.title = element_text(size = 16))
+
+# Negative granularity
+p2 <- effect_plot(model_viz_person,
+                  pred = neggran_person_avg_lemm,
+                  interval = TRUE,
+                  partial.residuals = TRUE,
+                  x.label = "Negative Granularity (person avg)",
+                  y.label = "Mental Wellbeing",
+                  colors = "royalblue1",
+                  line.colors = "black",
+                  point.size = 1.5,
+                  point.alpha = 0.3,
+                  jitter = 0.01)
+p2 + theme(axis.title = element_text(size = 16))
+```
+
+
+#Interactions without controlling for affective tone
+```{r}
+# Diversity interaction - person level (same style as text level plot)
+interact_plot(
+  model_viz_person,
+  pred = positive_diversity_lem,
+  modx = negative_diversity_lem,
+  interval = TRUE,
+  x.label = "Positive Diversity (person avg)",
+  y.label = "Mental Wellbeing",
+  legend.main = "Negative Diversity"
+)
+
+# Granularity interaction - person level
+interact_plot(
+  model_viz_person,
+  pred = posgran_person_avg_lemm,
+  modx = neggran_person_avg_lemm,
+  interval = TRUE,
+  x.label = "Positive Granularity (person avg)",
+  y.label = "Mental Wellbeing",
+  legend.main = "Negative Granularity"
+)
+```
