@@ -1,0 +1,216 @@
+---
+title: "granularity_diversity_no imputation"
+author: "Katie"
+format: html
+embed-resources: true
+---
+
+## Step 1
+
+Read in and prepare the data
+
+```{r}
+#| message: false
+
+library(readr)
+library(lme4) 
+library(lmerTest)
+library(broom.mixed)
+library(ggplot2)
+library(car)
+library(ggeffects)
+library(visreg)
+library(interactions)
+library(corrplot)
+library(Hmisc)
+library(dplyr)
+library(datawizard)
+library(easystats)
+library(effectsize)
+library(psych)
+```
+
+```{r}
+# read in person-level variables (diversity is calculated differently at person level)
+d_person <- read.csv("Shannon's diversity_person level_30 April 2026.csv", fileEncoding='UTF-8-BOM')
+```
+
+```{r}
+# read in text-level variables and get dimensions, missingness
+d_text <- read.csv("Input for MI_30 April_Revised_anonymized.csv", fileEncoding='UTF-8-BOM')
+```
+
+```{r}
+# get dimensions and stats
+dim(d_text)
+sum(!is.na(d_text$positive_granularity_lemm))
+sum(!is.na(d_text$negative_granularity_lemm))
+sum(!is.na(d_text$positive_granularity_lemm) & !is.na(d_text$negative_granularity_lemm))
+```
+```{r}
+# grab only the columns we need
+d_text_clean <- d_text[, c("alias", "connectionId", "posemo", "positive_diversity_Shannons_lem", "positive_granularity_lemm", "positive_unique_wordcount_lemm",
+                         "negemo", "negative_diversity_Shannons_lem", "negative_granularity_lemm", "negative_unique_wordcount_lemm", "valence")]
+```
+
+```{r}
+# aggregate variables and join to person-level data set
+d_text_clean_agg <- d_text_clean %>%
+  summarize(
+    posemo_person_avg = mean(posemo, na.rm = TRUE),
+    negemo_person_avg = mean(negemo, na.rm = TRUE),
+    positive_diversity_Shannons_lem_person_avg = mean(positive_diversity_Shannons_lem, na.rm = TRUE),
+    negative_diversity_Shannons_lem_person_avg = mean(negative_diversity_Shannons_lem, na.rm = TRUE),
+    positive_granularity_lemm_person_avg = mean(positive_granularity_lemm, na.rm = TRUE),
+    negative_granularity_lemm_person_avg = mean(negative_granularity_lemm, na.rm = TRUE),
+    .by = alias)
+d_person <- merge(d_person,d_text_clean_agg, by = "alias")
+```
+
+```{r}
+# read in questionnaire data
+d_quest <- read_csv("WHO-QOL_merged_no dupes_updated_fixed IDs.csv", show_col_types = FALSE)
+```
+
+```{r}
+# aggregate all questionnaire instances and join to person-level data set
+d_quest_agg <- d_quest %>%
+  summarize(Psychological_person_avg = mean(Psychological_QoL), .by = alias)
+d_person <- merge(d_person,d_quest_agg, by = "alias")
+```
+
+```{r}
+write.csv(d_person, "Combined_granularity_emodiversity_data_person_level_20 May 2026_no imputation.csv")
+```
+
+
+## Step 2
+
+Run mixed-effects models at the text level
+
+```{r}
+d_data <- d_text_clean
+```
+
+```{r}
+# person-mean-center variables for regression to separate within and between subjects variance
+d_data <- d_data %>%
+  group_by(connectionId) %>%
+  mutate(mean_posemo = mean(posemo, na.rm = TRUE),
+         mean_negemo = mean(negemo, na.rm = TRUE),
+         mean_posdiv = mean(positive_diversity_Shannons_lem, na.rm = TRUE),
+         mean_negdiv = mean(negative_diversity_Shannons_lem, na.rm = TRUE),
+         mean_posgran = mean(positive_granularity_lemm, na.rm = TRUE),
+         mean_neggran = mean(negative_granularity_lemm, na.rm = TRUE),
+         centered_posemo = posemo - mean_posemo,
+         centered_negemo = negemo - mean_negemo,
+         centered_posdiv = positive_diversity_Shannons_lem - mean_posdiv,
+         centered_negdiv = negative_diversity_Shannons_lem - mean_negdiv,
+         centered_posgran = positive_granularity_lemm - mean_posgran,
+         centered_neggran = negative_granularity_lemm - mean_neggran) %>%
+  ungroup()
+```
+
+```{r}
+# standardize L1 variables to assist with coefficient interpretation (do NOT include the DV)
+d_data_std <- standardize(d_data, select = c("centered_posemo", "centered_negemo", 
+                                                   "centered_posdiv", "centered_negdiv", 
+                                                   "centered_posgran", "centered_neggran"))
+```
+
+```{r}
+mlm_v_0 <- lmer(valence ~ 1 + (1|connectionId), data=d_data_std)
+icc(mlm_v_0)
+```
+
+```{r}
+mlm_v_1 <- lmer(valence ~ centered_posdiv * centered_negdiv +
+                centered_posgran * centered_neggran + (1|connectionId), data=d_data_std)
+summary(mlm_v_1)
+confint(mlm_v_1)
+```
+
+```{r}
+mlm_v_2 <- lmer(valence ~ centered_posemo * centered_negemo +
+                centered_posdiv * centered_negdiv +
+                centered_posgran * centered_neggran + (1|connectionId), data=d_data_std)
+summary(mlm_v_2)
+confint(mlm_v_2)
+```
+
+
+## Step 3
+
+Run linear regressions at the person level
+
+```{r}
+# standardize variables to assist with coefficient interpretation (include the DV here)
+d_person_std <- standardize(d_person, select = c("posemo_person_avg", "negemo_person_avg", "positive_diversity_lem", "negative_diversity_lem", "positive_granularity_lemm_person_avg", "negative_granularity_lemm_person_avg", "Psychological_person_avg"))
+```
+
+```{r}
+mr_wb_1 <- lm(Psychological_person_avg ~ positive_diversity_lem * negative_diversity_lem +
+                positive_granularity_lemm_person_avg * negative_granularity_lemm_person_avg, data=d_person_std)
+summary(mr_wb_1)
+confint(mr_wb_1)
+```
+
+```{r}
+mr_wb_2 <- lm(Psychological_person_avg ~ posemo_person_avg * negemo_person_avg +
+                positive_diversity_lem * negative_diversity_lem +
+                positive_granularity_lemm_person_avg * negative_granularity_lemm_person_avg, data=d_person_std)
+summary(mr_wb_2)
+confint(mr_wb_2)
+```
+
+
+## Step 4
+
+Generate scatterplot matrices with histograms
+
+```{r}
+d_text_clean_sub <- d_text_clean[, c("valence", "posemo", "positive_diversity_Shannons_lem", "positive_granularity_lemm", 
+                                     "negemo", "negative_diversity_Shannons_lem", "negative_granularity_lemm")]
+```
+
+```{r}
+new_names <- c("well-being", "posemo","posDiv","posGran","negemo","negDiv","negGran")
+colnames(d_text_clean_sub) <- new_names
+```
+
+```{r}
+pdf("scatterplot_text.pdf")
+pairs.panels(d_text_clean_sub,
+             method = "pearson",
+             hist.col = "#00AFBB",
+             density = TRUE,
+             ellipses = FALSE,
+             lm = TRUE
+             )
+dev.off()
+```
+```{r}
+d_person_sub <- d_person[, c("Psychological_person_avg", "posemo_person_avg", "positive_diversity_lem", "positive_granularity_lemm_person_avg", 
+                                     "negemo_person_avg", "negative_diversity_lem", "negative_granularity_lemm_person_avg")]
+```
+
+```{r}
+colnames(d_person_sub) <- new_names
+```
+
+```{r}
+pdf("scatterplot_person.pdf")
+pairs.panels(d_person_sub,
+             method = "pearson",
+             hist.col = "#00AFBB",
+             density = TRUE,
+             ellipses = FALSE,
+             lm = TRUE
+             )
+dev.off()
+```
+
+
+
+
+
